@@ -1,0 +1,312 @@
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <unordered_map>
+#include <functional>
+#include <atomic>
+#include <thread>
+#include <coroutine>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+//===================== 类型别名 =====================
+template <typename T>
+using Ref = std::shared_ptr<T>;
+
+template <typename T>
+using Unique = std::unique_ptr<T>;
+
+using ByteBuffer = std::vector<uint8_t>;
+using IPAddress = std::string;
+using Port = uint16_t;
+
+//===================== 异常体系 =====================
+class NetworkException : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+    
+    NetworkException(int errno_value, const std::string& msg)
+        : std::runtime_error(msg + ": " + strerror(errno_value)) 
+    {}
+};
+
+//===================== 配置系统 =====================
+struct ServerConfig {
+    IPAddress bind_address = "0.0.0.0";
+    Port port = 8080;
+    int max_connections = 10000;
+    int io_threads = std::thread::hardware_concurrency();
+    bool reuse_port = true;
+    bool tcp_no_delay = true;
+    
+    static ServerConfig from_json(const json& j) {
+        return {
+            j.value("bind_address", "0.0.0.0"),
+            j.value("port", 8080),
+            j.value("max_connections", 10000),
+            j.value("io_threads", std::thread::hardware_concurrency()),
+            j.value("reuse_port", true),
+            j.value("tcp_no_delay", true)
+        };
+    }
+};
+
+//===================== 事件循环核心 =====================
+class EpollEventLoop {
+    int epoll_fd;
+    std::atomic<bool> running{false};
+    std::thread worker_thread;
+    
+    struct EventContext {
+        int fd;
+        std::function<void(uint32_t)> callback;
+    };
+    
+    std::unordered_map<int, EventContext> handlers;
+    
+public:
+    EpollEventLoop() {
+        if((epoll_fd = epoll_create1(0)) < 0) {
+            throw NetworkException(errno, "epoll_create1 failed");
+        }
+    }
+    
+    ~EpollEventLoop() {
+        stop();
+        close(epoll_fd);
+    }
+    
+    void add_fd(int fd, uint32_t events, auto&& callback) {
+        epoll_event ev{};
+        ev.events = events;
+        ev.data.fd = fd;
+        
+        if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            throw NetworkException(errno, "epoll_ctl add failed");
+        }
+        
+        handlers[fd] = {fd, std::forward<decltype(callback)>(callback)};
+    }
+    
+    void modify_fd(int fd, uint32_t events) {
+        epoll_event ev{};
+        ev.events = events;
+        ev.data.fd = fd;
+        
+        if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) < 0) {
+            throw NetworkException(errno, "epoll_ctl mod failed");
+        }
+    }
+    
+    void remove_fd(int fd) {
+        if(epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0) {
+            throw NetworkException(errno, "epoll_ctl del failed");
+        }
+        handlers.erase(fd);
+    }
+    
+    void start() {
+        running = true;
+        worker_thread = std::thread([this](){
+            constexpr int MAX_EVENTS = 128;
+            epoll_event events[MAX_EVENTS];
+            
+            while(running) {
+                int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+                for(int i=0; i<n; ++i) {
+                    auto& ctx = handlers.at(events[i].data.fd);
+                    ctx.callback(events[i].events);
+                }
+            }
+        });
+    }
+    
+    void stop() {
+        running = false;
+        if(worker_thread.joinable()) {
+            worker_thread.join();
+        }
+    }
+};
+
+//===================== 协程支持 =====================
+struct AsyncReadAwaiter {
+    int fd;
+    ByteBuffer& buffer;
+    ssize_t result;
+    bool await_ready() const noexcept { return false; }
+    
+    void await_suspend(std::coroutine_handle<> h) {
+        // 注册到事件循环...
+    }
+    
+    ssize_t await_resume() { return result; }
+};
+
+struct AsyncWriteAwaiter {
+    int fd;
+    const ByteBuffer& buffer;
+    ssize_t result;
+    bool await_ready() const noexcept { return false; }
+    
+    void await_suspend(std::coroutine_handle<> h) {
+        // 注册到事件循环...
+    }
+    
+    ssize_t await_resume() { return result; }
+};
+
+//===================== 连接会话 =====================
+class Connection : public std::enable_shared_from_this<Connection> {
+    int fd;
+    sockaddr_in client_addr;
+    Ref<EpollEventLoop> event_loop;
+    
+public:
+    Connection(int fd, sockaddr_in addr, Ref<EpollEventLoop> loop)
+        : fd(fd), client_addr(addr), event_loop(loop) 
+    {
+        set_nonblocking(fd);
+    }
+    
+    ~Connection() {
+        if(fd != -1) {
+            close(fd);
+        }
+    }
+    
+    static void set_nonblocking(int fd) {
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+    
+    Task<void> handle() {
+        try {
+            while(true) {
+                ByteBuffer buffer(1024);
+                ssize_t n = co_await AsyncReadAwaiter{fd, buffer};
+                
+                if(n <= 0) break;
+                
+                // 业务处理逻辑
+                co_await AsyncWriteAwaiter{fd, buffer};
+            }
+        }
+        catch(const std::exception& e) {
+            std::cerr << "Connection error: " << e.what() << std::endl;
+        }
+        
+        event_loop->remove_fd(fd);
+    }
+    
+    std::string client_ip() const {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
+        return ip;
+    }
+};
+
+//===================== TCP服务器核心 =====================
+class TcpServer {
+    ServerConfig config;
+    std::vector<Ref<EpollEventLoop>> io_loops;
+    int listen_fd;
+    std::atomic<size_t> current_loop = 0;
+    
+    void create_listen_socket() {
+        listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if(listen_fd < 0) {
+            throw NetworkException(errno, "socket creation failed");
+        }
+        
+        int opt = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(config.port);
+        inet_pton(AF_INET, config.bind_address.c_str(), &addr.sin_addr);
+        
+        if(bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            throw NetworkException(errno, "bind failed");
+        }
+        
+        if(listen(listen_fd, config.max_connections) < 0) {
+            throw NetworkException(errno, "listen failed");
+        }
+    }
+    
+    void start_accept() {
+        auto& loop = io_loops[current_loop++ % io_loops.size()];
+        
+        loop->add_fd(listen_fd, EPOLLIN | EPOLLET, [this](uint32_t events){
+            while(true) {
+                sockaddr_in client_addr{};
+                socklen_t addr_len = sizeof(client_addr);
+                int conn_fd = accept4(listen_fd, (sockaddr*)&client_addr, 
+                                    &addr_len, SOCK_NONBLOCK);
+                
+                if(conn_fd < 0) {
+                    if(errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    throw NetworkException(errno, "accept failed");
+                }
+                
+                auto conn = std::make_shared<Connection>(conn_fd, client_addr, 
+                                                        io_loops[current_loop++ % io_loops.size()]);
+                conn->handle();
+            }
+        });
+    }
+    
+public:
+    explicit TcpServer(ServerConfig cfg) : config(std::move(cfg)) {
+        create_listen_socket();
+        
+        // 初始化IO线程池
+        for(int i=0; i<config.io_threads; ++i) {
+            io_loops.push_back(std::make_shared<EpollEventLoop>());
+        }
+    }
+    
+    void run() {
+        for(auto& loop : io_loops) {
+            loop->start();
+        }
+        start_accept();
+        
+        // 保持主线程运行
+        while(true) {
+            std::this_thread::sleep_for(std::chrono::hours(1));
+        }
+    }
+    
+    void reload_config(const ServerConfig& new_cfg) {
+        // 实现配置热更新逻辑
+    }
+};
+
+//===================== 使用示例 =====================
+int main()
+{
+    try
+    {
+        ServerConfig cfg;
+        cfg.port = 8080;
+        cfg.io_threads = 4;
+
+        TcpServer server(cfg);
+        server.run();
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Server fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+    return 0;
+}
