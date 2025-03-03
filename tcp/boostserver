@@ -1,0 +1,217 @@
+// main.cpp
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+
+#include <boost/asio.hpp>
+#include <boost/bind/bind.hpp>
+
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <vector>
+#include <algorithm>
+#include <sstream>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+
+using boost::asio::ip::tcp;
+
+//--------------------------------------------------------------------
+// 日志辅助函数（打印带时间戳的日志）
+void log(const std::string &msg) {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    std::cout << "[" << std::put_time(std::localtime(&now_time), "%Y-%m-%d %H:%M:%S")
+              << "] " << msg << std::endl;
+}
+
+//--------------------------------------------------------------------
+// Session 类封装单个客户端连接，采用异步写入机制。
+// 利用 std::enable_shared_from_this 保证异步操作中对象的生命周期。
+class Session : public std::enable_shared_from_this<Session> {
+public:
+    explicit Session(boost::asio::io_service &io_service)
+        : socket_(io_service)
+    {}
+
+    tcp::socket &socket() { return socket_; }
+
+    // 启动会话，开始异步读取（主要用于监测断线）
+    void start() {
+        log("New client connected: " + socket_.remote_endpoint().address().to_string());
+        do_read();
+    }
+
+    // 异步写数据，保证线程安全，内部维护消息队列
+    void deliver(const std::string &msg) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        bool write_in_progress = !write_msgs_.empty();
+        write_msgs_.push_back(msg);
+        if (!write_in_progress) {
+            do_write();
+        }
+    }
+
+private:
+    // 异步写操作，写完一个消息后继续写队列中的其他消息
+    void do_write() {
+        auto self(shared_from_this());
+        boost::asio::async_write(socket_, boost::asio::buffer(write_msgs_.front()),
+            [this, self](boost::system::error_code ec, std::size_t /*length*/) {
+                std::lock_guard<std::mutex> lock(write_mutex_);
+                if (!ec) {
+                    write_msgs_.pop_front();
+                    if (!write_msgs_.empty()) {
+                        do_write();
+                    }
+                } else {
+                    log("Write error, closing session.");
+                    socket_.close();
+                }
+            });
+    }
+
+    // 异步读操作，用于监测连接状态
+    void do_read() {
+        auto self(shared_from_this());
+        socket_.async_read_some(boost::asio::buffer(data_, max_length),
+            [this, self](boost::system::error_code ec, std::size_t length) {
+                if (!ec) {
+                    // 若有需要，可对客户端发送的数据进行处理
+                    std::cout << "data:" << data_ << std::endl;
+                    do_read();
+                } else {
+                    log("Client disconnected.");
+                    socket_.close();
+                }
+            });
+    }
+
+    tcp::socket socket_;
+    enum { max_length = 1024 };
+    char data_[max_length];
+    std::deque<std::string> write_msgs_;
+    std::mutex write_mutex_;
+};
+
+//--------------------------------------------------------------------
+// TCPServer 类负责监听端口、接受新连接，并保存所有会话（Session）。
+// 同时提供 broadcast() 接口将数据发送到所有已连接客户端。
+class TCPServer {
+public:
+    TCPServer(boost::asio::io_service &io_service, short port)
+        : acceptor_(io_service, tcp::endpoint(tcp::v4(), port)),
+          io_service_(io_service)
+    {
+        start_accept();
+    }
+
+    // 向所有存活的客户端广播消息
+    void broadcast(const std::string &msg) {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        // 先清除已经断开的连接
+        sessions_.erase(std::remove_if(sessions_.begin(), sessions_.end(),
+            [](const std::shared_ptr<Session> &session) {
+                return !session->socket().is_open();
+            }), sessions_.end());
+        // 发送消息给所有会话
+        for (auto &session : sessions_) {
+            session->deliver(msg);
+        }
+    }
+
+private:
+    // 异步接受新连接，创建新的 Session 实例，并在连接成功后启动会话
+    void start_accept() {
+        auto new_session = std::make_shared<Session>(io_service_);
+        acceptor_.async_accept(new_session->socket(),
+            [this, new_session](const boost::system::error_code &error) {
+                if (!error) {
+                    {
+                        std::lock_guard<std::mutex> lock(sessions_mutex_);
+                        sessions_.push_back(new_session);
+                    }
+                    new_session->start();
+                } else {
+                    log("Accept error: " + error.message());
+                }
+                // 继续接受下一个连接
+                start_accept();
+            });
+    }
+
+    tcp::acceptor acceptor_;
+    boost::asio::io_service &io_service_;
+    std::vector<std::shared_ptr<Session>> sessions_;
+    std::mutex sessions_mutex_;
+};
+
+//--------------------------------------------------------------------
+// XML转换函数，将 ROS 消息转换为 XML 格式字符串。
+// 这里简单包装了消息内容和当前时间戳，你可以根据需要扩展更多字段或结构。
+std::string convertToXML(const std_msgs::String::ConstPtr &msg) {
+    std::ostringstream oss;
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    // 利用 std::put_time 格式化时间，避免 ctime 中带有换行符
+    oss << "<message timestamp=\"" 
+        << std::put_time(std::localtime(&now_time), "%Y-%m-%d %H:%M:%S")
+        << "\">";
+    oss << "<data>" << msg->data << "</data>";
+    oss << "</message>";
+    return oss.str();
+}
+
+//--------------------------------------------------------------------
+// 主函数：初始化 ROS 节点、启动 TCP 服务端、并订阅 ROS topic
+int main(int argc, char **argv) {
+    // 初始化 ROS 节点
+    ros::init(argc, argv, "tcp_ros_bridge");
+    ros::NodeHandle nh;
+
+    // 参数化 TCP 服务端端口（可通过 ROS 参数服务器配置）
+    int port;
+    nh.param("tcp_port", port, 5000);
+
+    // 创建 Boost.Asio IO 服务对象
+    boost::asio::io_service io_service;
+
+    // 创建 TCPServer 对象，开始监听端口
+    TCPServer server(io_service, static_cast<short>(port));
+
+    log("TCP Server started on port " + std::to_string(port));
+
+    // 采用独立线程运行 io_service 的事件循环，确保异步 IO 与 ROS 同时运行
+    std::thread io_thread([&io_service]() {
+        try {
+            io_service.run();
+        } catch (std::exception &e) {
+            log(std::string("IO service exception: ") + e.what());
+        }
+    });
+
+    // 订阅 ROS topic，回调中转换消息为 XML 并广播给所有客户端
+    ros::Subscriber sub = nh.subscribe<std_msgs::String>("sensor_data", 1000,
+        [&server](const std_msgs::String::ConstPtr &msg) {
+            std::string xml = convertToXML(msg);
+            // 这里可增加更复杂的处理逻辑或过滤条件
+            server.broadcast(xml);
+            log("Broadcasted message: " + xml);
+        });
+
+
+
+    // ROS 事件循环
+    ros::spin();
+
+    // ROS 退出后，停止 IO 服务并等待线程退出
+    io_service.stop();
+    if (io_thread.joinable())
+        io_thread.join();
+
+    log("TCP ROS Bridge shutting down.");
+
+    return 0;
+}
