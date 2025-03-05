@@ -1,0 +1,408 @@
+#include <zmq.hpp>
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <unordered_map>
+#include <string>
+#include <sstream>
+#include <fstream>
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <cstdlib>
+#include <climits>
+
+// ======================= AsyncLogger =========================
+// 异步日志模块：后台线程异步写日志，不阻塞主流程
+class AsyncLogger {
+public:
+    AsyncLogger(const std::string& filename)
+        : stopFlag(false)
+    {
+        logFile.open(filename, std::ios::app);
+        worker = std::thread(&AsyncLogger::process, this);
+    }
+    ~AsyncLogger() {
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            stopFlag = true;
+        }
+        cv.notify_all();
+        if (worker.joinable())
+            worker.join();
+        logFile.close();
+    }
+    void log(const std::string& message) {
+        std::unique_lock<std::mutex> lock(mtx);
+        logQueue.push(message);
+        cv.notify_one();
+    }
+private:
+    void process() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [this] { return !logQueue.empty() || stopFlag; });
+            while (!logQueue.empty()) {
+                logFile << logQueue.front() << std::endl;
+                logQueue.pop();
+            }
+            if (stopFlag && logQueue.empty())
+                break;
+        }
+    }
+    std::queue<std::string> logQueue;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::thread worker;
+    std::ofstream logFile;
+    bool stopFlag;
+};
+
+// ======================= Task & Task Comparator =========================
+// 任务数据结构（可扩展，如添加预抢占相关的字段、任务上下文等）
+struct Task {
+    uint64_t taskId;
+    int priority;             // 数值越小优先级越高
+    std::string payload;      // 任务数据（在实际项目中可使用Protobuf序列化）
+};
+
+// 自定义比较器，实现最小堆（std::priority_queue默认是最大堆）
+struct TaskComparator {
+    bool operator()(const Task &a, const Task &b) const {
+        return a.priority > b.priority; // 数值较小的任务优先级高
+    }
+};
+
+// ======================= WorkerInfo =========================
+// 用于调度器中保存工作节点状态的信息
+struct WorkerInfo {
+    std::string workerId;
+    int load;  // 当前负载（例如：正在处理的任务数）
+    std::chrono::steady_clock::time_point lastHeartbeat;
+};
+
+// ======================= Scheduler =========================
+// 调度器负责：
+// 1. 维护任务队列（支持优先级调度与未来任务抢占扩展）
+// 2. 维护工作节点注册信息、心跳监测
+// 3. 根据负载均衡算法（这里简单选择负载最低节点）调度任务下发
+class Scheduler {
+public:
+    Scheduler(const std::string& endpoint)
+        : context(1), router(context, ZMQ_ROUTER), logger("scheduler.log"), stopFlag(false)
+    {
+        router.bind(endpoint);
+    }
+    
+    ~Scheduler() {
+        stopFlag = true;
+        if (heartbeatThread.joinable())
+            heartbeatThread.join();
+        if (eventLoopThread.joinable())
+            eventLoopThread.join();
+    }
+    
+    // 启动调度器的事件循环和心跳检测线程
+    void start() {
+        heartbeatThread = std::thread(&Scheduler::heartbeatMonitor, this);
+        eventLoopThread = std::thread(&Scheduler::eventLoop, this);
+    }
+    
+    // 添加任务到任务队列
+    void addTask(const Task &task) {
+        std::lock_guard<std::mutex> lock(taskMutex);
+        taskQueue.push(task);
+        logger.log("Task added: ID=" + std::to_string(task.taskId) +
+                   ", priority=" + std::to_string(task.priority));
+    }
+    
+private:
+    zmq::context_t context;
+    zmq::socket_t router; // ROUTER 套接字，用于与工作节点通信
+    
+    // 任务队列及保护锁
+    std::priority_queue<Task, std::vector<Task>, TaskComparator> taskQueue;
+    std::mutex taskMutex;
+    
+    // 工作节点注册信息及保护锁
+    std::unordered_map<std::string, WorkerInfo> workers;
+    std::mutex workersMutex;
+    
+    // 异步日志实例
+    AsyncLogger logger;
+    
+    std::thread heartbeatThread;
+    std::thread eventLoopThread;
+    std::atomic<bool> stopFlag;
+    
+    // 定时检查心跳，移除超时的节点（这里设定 5 秒内未收到心跳认为超时）
+    void heartbeatMonitor() {
+        while (!stopFlag) {
+            {
+                std::lock_guard<std::mutex> lock(workersMutex);
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = workers.begin(); it != workers.end(); ) {
+                    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.lastHeartbeat);
+                    if (duration.count() > 5) {
+                        logger.log("Worker " + it->first + " timed out. Removing.");
+                        it = workers.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+    
+    // 主事件循环：接收工作节点消息，处理注册、心跳、任务结果，并调度任务
+    void eventLoop() {
+        zmq::pollitem_t items[] = {
+            { static_cast<void*>(router), 0, ZMQ_POLLIN, 0 }
+        };
+        
+        while (!stopFlag) {
+            zmq::poll(items, 1, 100); // 100ms 超时轮询
+            if (items[0].revents & ZMQ_POLLIN) {
+                // ROUTER消息格式：[workerId][空帧][message]
+                zmq::message_t identity;
+                router.recv(&identity);
+                std::string workerId(static_cast<char*>(identity.data()), identity.size());
+                
+                zmq::message_t empty;
+                router.recv(&empty);
+                
+                zmq::message_t msg;
+                router.recv(&msg);
+                std::string message(static_cast<char*>(msg.data()), msg.size());
+                
+                // 解析消息，格式 "TYPE|data"，例如 "REGISTER|", "HEARTBEAT|<load>", "RESULT|<taskId>|<result>"
+                std::istringstream iss(message);
+                std::string type;
+                getline(iss, type, '|');
+                if (type == "REGISTER") {
+                    handleRegister(workerId, iss);
+                } else if (type == "HEARTBEAT") {
+                    handleHeartbeat(workerId, iss);
+                } else if (type == "RESULT") {
+                    handleResult(workerId, iss);
+                }
+                // 每次消息处理后尝试调度任务
+                dispatchTasks();
+            }
+        }
+    }
+    
+    // 处理注册消息
+    void handleRegister(const std::string &workerId, std::istringstream &iss) {
+        std::lock_guard<std::mutex> lock(workersMutex);
+        WorkerInfo info;
+        info.workerId = workerId;
+        info.load = 0;
+        info.lastHeartbeat = std::chrono::steady_clock::now();
+        workers[workerId] = info;
+        logger.log("Worker registered: " + workerId);
+    }
+    
+    // 处理心跳消息，格式 "HEARTBEAT|<load>"
+    void handleHeartbeat(const std::string &workerId, std::istringstream &iss) {
+        int load = 0;
+        std::string loadStr;
+        getline(iss, loadStr, '|');
+        try {
+            load = std::stoi(loadStr);
+        } catch (...) {
+            load = 0;
+        }
+        std::lock_guard<std::mutex> lock(workersMutex);
+        if (workers.find(workerId) != workers.end()) {
+            workers[workerId].load = load;
+            workers[workerId].lastHeartbeat = std::chrono::steady_clock::now();
+            logger.log("Heartbeat from " + workerId + " with load " + std::to_string(load));
+        }
+    }
+    
+    // 处理任务结果消息，格式 "RESULT|<taskId>|<result>"
+    void handleResult(const std::string &workerId, std::istringstream &iss) {
+        std::string taskIdStr;
+        getline(iss, taskIdStr, '|');
+        std::string result;
+        getline(iss, result, '|');
+        logger.log("Result from " + workerId + " for task " + taskIdStr + ": " + result);
+        // 收到结果后减少该工作节点负载
+        std::lock_guard<std::mutex> lock(workersMutex);
+        if (workers.find(workerId) != workers.end() && workers[workerId].load > 0)
+            workers[workerId].load--;
+    }
+    
+    // 调度任务下发：采用简单负载均衡，选择负载最小的节点
+    void dispatchTasks() {
+        std::lock_guard<std::mutex> taskLock(taskMutex);
+        if (taskQueue.empty())
+            return;
+        
+        std::string selectedWorker;
+        int minLoad = INT_MAX;
+        {
+            std::lock_guard<std::mutex> lock(workersMutex);
+            // 遍历工作节点，选取负载最低的节点
+            for (auto &pair : workers) {
+                if (pair.second.load < minLoad) {
+                    minLoad = pair.second.load;
+                    selectedWorker = pair.first;
+                }
+            }
+        }
+        if (selectedWorker.empty())
+            return; // 无可用工作节点
+        
+        // 从队列中取出一个任务
+        Task task = taskQueue.top();
+        taskQueue.pop();
+        
+        // 构造任务消息，格式 "TASK|<taskId>|<priority>|<payload>"
+        std::ostringstream oss;
+        oss << "TASK|" << task.taskId << "|" << task.priority << "|" << task.payload;
+        std::string taskMsg = oss.str();
+        
+        zmq::message_t identity(selectedWorker.data(), selectedWorker.size());
+        zmq::message_t empty(0);
+        zmq::message_t message(taskMsg.data(), taskMsg.size());
+        
+        // 发送多部分消息：[workerId][空帧][消息]
+        router.send(identity, ZMQ_SNDMORE);
+        router.send(empty, ZMQ_SNDMORE);
+        router.send(message);
+        
+        // 更新工作节点负载
+        {
+            std::lock_guard<std::mutex> lock(workersMutex);
+            if (workers.find(selectedWorker) != workers.end())
+                workers[selectedWorker].load++;
+        }
+        logger.log("Dispatched task " + std::to_string(task.taskId) + " to worker " + selectedWorker);
+    }
+};
+
+// ======================= Worker =========================
+// 工作节点实现：
+// 1. 启动后向调度器注册
+// 2. 定时发送心跳
+// 3. 接收任务、模拟执行并返回结果
+class Worker {
+public:
+    Worker(const std::string &workerId, const std::string &endpoint)
+        : context(1), dealer(context, ZMQ_DEALER), id(workerId), stopFlag(false)
+    {
+        // 设置 DEALER 套接字的标识（用于调度器识别）
+        dealer.setsockopt(ZMQ_IDENTITY, id.data(), id.size());
+        dealer.connect(endpoint);
+    }
+    
+    ~Worker() {
+        stopFlag = true;
+        if (workerThread.joinable())
+            workerThread.join();
+        if (heartbeatThread.joinable())
+            heartbeatThread.join();
+    }
+    
+    // 启动工作节点（注册、心跳和任务处理线程）
+    void start() {
+        sendMessage("REGISTER|");
+        heartbeatThread = std::thread(&Worker::sendHeartbeat, this);
+        workerThread = std::thread(&Worker::processTasks, this);
+    }
+    
+private:
+    zmq::context_t context;
+    zmq::socket_t dealer; // DEALER 套接字用于与调度器通信
+    std::string id;
+    std::atomic<bool> stopFlag;
+    std::thread workerThread;
+    std::thread heartbeatThread;
+    
+    // 发送消息的简单封装
+    void sendMessage(const std::string &msg) {
+        zmq::message_t message(msg.data(), msg.size());
+        dealer.send(message);
+    }
+    
+    // 心跳线程：每2秒发送一次心跳消息，附带当前模拟负载
+    void sendHeartbeat() {
+        while (!stopFlag) {
+            int load = rand() % 2; // 模拟负载（0或1，可扩展为实际任务数）
+            std::ostringstream oss;
+            oss << "HEARTBEAT|" << load;
+            sendMessage(oss.str());
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+    
+    // 主处理线程：非阻塞接收任务消息，解析后模拟处理（睡眠3秒）并发送结果
+    void processTasks() {
+        while (!stopFlag) {
+            zmq::message_t message;
+            // 非阻塞接收
+            if (dealer.recv(&message, ZMQ_DONTWAIT)) {
+                std::string msg(static_cast<char*>(message.data()), message.size());
+                // 解析任务消息：格式 "TASK|<taskId>|<priority>|<payload>"
+                std::istringstream iss(msg);
+                std::string type;
+                getline(iss, type, '|');
+                if (type == "TASK") {
+                    std::string taskIdStr, priorityStr, payload;
+                    getline(iss, taskIdStr, '|');
+                    getline(iss, priorityStr, '|');
+                    getline(iss, payload, '|');
+                    
+                    std::cout << "Worker " << id << " processing task " << taskIdStr
+                              << " with payload: " << payload << std::endl;
+                    // 模拟任务执行
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    
+                    // 任务执行完毕，返回结果
+                    std::ostringstream oss;
+                    oss << "RESULT|" << taskIdStr << "|Done";
+                    sendMessage(oss.str());
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+};
+
+// ======================= main =========================
+// 主函数：启动调度器，启动多个工作节点，并周期性添加任务
+int main() {
+    // 启动调度器（监听端口5555）
+    Scheduler scheduler("tcp://*:5555");
+    scheduler.start();
+    
+    // 创建并启动两个工作节点
+    std::vector<std::unique_ptr<Worker>> workers;
+    workers.push_back(std::make_unique<Worker>("worker1", "tcp://localhost:5555"));
+    workers.push_back(std::make_unique<Worker>("worker2", "tcp://localhost:5555"));
+    for (auto &w : workers)
+        w->start();
+    
+    // 模拟添加任务
+    uint64_t taskIdCounter = 1;
+    for (int i = 0; i < 10; i++) {
+        Task task;
+        task.taskId = taskIdCounter++;
+        task.priority = rand() % 10;  // 随机优先级（0-9）
+        task.payload = "Task payload " + std::to_string(task.taskId);
+        scheduler.addTask(task);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    
+    // 让系统运行一段时间观察效果
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    
+    return 0;
+}
